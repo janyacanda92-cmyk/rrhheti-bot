@@ -24,6 +24,10 @@ Autor: generado con Claude
 import logging
 import os
 import sqlite3
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils import get_column_letter
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -272,6 +276,17 @@ def contar_expedientes():
     return rows
 
 
+def obtener_todos_expedientes():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT nombre, carnet, estado, departamento, ubicacion FROM expedientes ORDER BY nombre"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 # ---------- Control de acceso ----------
 
 async def verificar_acceso(update: Update) -> bool:
@@ -384,6 +399,7 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/retirar <nombre o carnet> - marca el expediente como Retirado (alguien se lo llevó, conserva historial)\n"
         "/eliminar <nombre o carnet> - borra el expediente para siempre (pide confirmación)\n"
         "/lista - muestra un resumen de cuántos expedientes hay\n"
+        "/exportar - descarga el listado completo en un archivo Excel\n"
         "/cancelar - cancela el proceso de agregar en curso"
     )
     if es_admin(update.effective_user.id):
@@ -527,6 +543,62 @@ async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for estado, cantidad in rows:
         texto += f"{estado}: {cantidad}\n"
     await update.message.reply_text(texto)
+
+
+async def exportar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await verificar_acceso(update):
+        return
+    filas = obtener_todos_expedientes()
+    if not filas:
+        await update.message.reply_text("Todavía no hay expedientes registrados para exportar.")
+        return
+
+    await update.message.reply_text("Generando el archivo Excel, un momento...")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Expedientes"
+
+    encabezados = ["Nombre", "Carnet de Identidad", "Estado", "Departamento/Dirección", "Ubicación"]
+    ws.append(encabezados)
+    for fila in filas:
+        ws.append(list(fila))
+
+    # Convertir el rango en una Tabla de Excel con estilo
+    num_filas = len(filas) + 1  # +1 por el encabezado
+    num_columnas = len(encabezados)
+    ultima_columna = get_column_letter(num_columnas)
+    rango_tabla = f"A1:{ultima_columna}{num_filas}"
+
+    tabla = Table(displayName="Expedientes", ref=rango_tabla)
+    estilo = TableStyleInfo(
+        name="TableStyleMedium9",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    tabla.tableStyleInfo = estilo
+    ws.add_table(tabla)
+
+    # Ajustar ancho de columnas automáticamente según el contenido
+    for col_idx in range(1, num_columnas + 1):
+        letra = get_column_letter(col_idx)
+        max_len = max(
+            [len(str(encabezados[col_idx - 1]))]
+            + [len(str(fila[col_idx - 1])) for fila in filas if fila[col_idx - 1] is not None]
+        )
+        ws.column_dimensions[letra].width = max_len + 4
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    await update.message.reply_document(
+        document=buffer,
+        filename="expedientes.xlsx",
+        caption=f"📊 Listado completo: {len(filas)} expediente(s).",
+    )
 
 
 async def usuarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -684,6 +756,7 @@ def main():
     app.add_handler(CommandHandler("retirar", retirar))
     app.add_handler(CommandHandler("eliminar", eliminar))
     app.add_handler(CommandHandler("lista", lista))
+    app.add_handler(CommandHandler("exportar", exportar))
     app.add_handler(CommandHandler("usuarios", usuarios))
     app.add_handler(CommandHandler("rol", cambiar_rol))
     app.add_handler(CommandHandler("revocar", revocar))
