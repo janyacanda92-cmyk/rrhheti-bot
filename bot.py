@@ -17,7 +17,8 @@ Autor: generado con Claude
 import logging
 import os
 import re
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from io import BytesIO
 
 from openpyxl import Workbook
@@ -47,9 +48,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_DB_DIR = os.environ.get("DB_DIR", os.path.dirname(__file__))
-os.makedirs(_DB_DIR, exist_ok=True)
-DB_PATH = os.path.join(_DB_DIR, "expedientes.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "Falta la variable de entorno DATABASE_URL. "
+            "Asegúrate de haber agregado una base de datos PostgreSQL en Railway."
+        )
+    return psycopg2.connect(DATABASE_URL)
 
 # ID de Telegram del administrador (tu cuenta). Siempre tiene acceso total.
 ADMIN_USER_ID = 1186207945
@@ -75,9 +83,9 @@ ESTADOS_EXPEDIENTE = ["Activo", "Baja"]
 NOMBRE_BOT = "Lucas"
 
 PATRONES_BUSQUEDA = [
-    r"d[oó]nde est[aá]\s+(?:el\s+)?expediente\s+de\s+(.+)",
+    r"d[oó]nde est[aá]\s+(%s:el\s+)%sexpediente\s+de\s+(.+)",
     r"d[oó]nde est[aá]\s+(.+)",
-    r"busca(?:r)?\s+(?:a\s+|el\s+expediente\s+de\s+)?(.+)",
+    r"busca(%s:r)%s\s+(%s:a\s+|el\s+expediente\s+de\s+)%s(.+)",
     r"expediente\s+de\s+(.+)",
     r"ubicaci[oó]n\s+de\s+(.+)",
 ]
@@ -88,13 +96,13 @@ def detectar_busqueda_natural(texto):
     Si el texto parece una pregunta/orden de búsqueda en lenguaje natural,
     devuelve el término a buscar (nombre o carnet). Si no, devuelve None.
     """
-    texto_limpio = re.sub(rf"^{NOMBRE_BOT}[,:]?\s*", "", texto.strip(), flags=re.IGNORECASE)
-    texto_lower = texto_limpio.lower().strip(" ?¿!¡.")
+    texto_limpio = re.sub(rf"^{NOMBRE_BOT}[,:]%s\s*", "", texto.strip(), flags=re.IGNORECASE)
+    texto_lower = texto_limpio.lower().strip(" %s¿!¡.")
 
     for patron in PATRONES_BUSQUEDA:
         match = re.search(patron, texto_lower, flags=re.IGNORECASE)
         if match:
-            termino = match.group(1).strip(" ?¿!¡.")
+            termino = match.group(1).strip(" %s¿!¡.")
             if termino:
                 return termino
     return None
@@ -117,12 +125,12 @@ BTN_CANCELAR = "✖️ Cancelar"
 # ---------- Base de datos ----------
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS expedientes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             nombre TEXT NOT NULL,
             carnet TEXT,
             estado TEXT NOT NULL DEFAULT 'Activo',
@@ -161,9 +169,9 @@ def es_admin(user_id):
 def esta_autorizado(user_id):
     if es_admin(user_id):
         return True
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM usuarios_autorizados WHERE user_id = ?", (user_id,))
+    cur.execute("SELECT 1 FROM usuarios_autorizados WHERE user_id = %s", (user_id,))
     row = cur.fetchone()
     conn.close()
     return row is not None
@@ -172,9 +180,9 @@ def esta_autorizado(user_id):
 def obtener_rol(user_id):
     if es_admin(user_id):
         return "admin"
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT rol FROM usuarios_autorizados WHERE user_id = ?", (user_id,))
+    cur.execute("SELECT rol FROM usuarios_autorizados WHERE user_id = %s", (user_id,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
@@ -185,19 +193,20 @@ def puede_editar(user_id):
 
 
 def hay_solicitud_pendiente(user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM solicitudes_pendientes WHERE user_id = ?", (user_id,))
+    cur.execute("SELECT 1 FROM solicitudes_pendientes WHERE user_id = %s", (user_id,))
     row = cur.fetchone()
     conn.close()
     return row is not None
 
 
 def crear_solicitud(user_id, nombre, username):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR REPLACE INTO solicitudes_pendientes (user_id, nombre, username) VALUES (?, ?, ?)",
+        "INSERT INTO solicitudes_pendientes (user_id, nombre, username) VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET nombre = EXCLUDED.nombre, username = EXCLUDED.username",
         (user_id, nombre, username),
     )
     conn.commit()
@@ -205,18 +214,19 @@ def crear_solicitud(user_id, nombre, username):
 
 
 def eliminar_solicitud(user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM solicitudes_pendientes WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM solicitudes_pendientes WHERE user_id = %s", (user_id,))
     conn.commit()
     conn.close()
 
 
 def aprobar_usuario(user_id, nombre, username, rol="editor"):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR REPLACE INTO usuarios_autorizados (user_id, nombre, username, rol) VALUES (?, ?, ?, ?)",
+        "INSERT INTO usuarios_autorizados (user_id, nombre, username, rol) VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET nombre = EXCLUDED.nombre, username = EXCLUDED.username, rol = EXCLUDED.rol",
         (user_id, nombre, username, rol),
     )
     conn.commit()
@@ -224,9 +234,9 @@ def aprobar_usuario(user_id, nombre, username, rol="editor"):
 
 
 def revocar_usuario(user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM usuarios_autorizados WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM usuarios_autorizados WHERE user_id = %s", (user_id,))
     affected = cur.rowcount
     conn.commit()
     conn.close()
@@ -234,7 +244,7 @@ def revocar_usuario(user_id):
 
 
 def listar_usuarios_autorizados():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT user_id, nombre, username, rol FROM usuarios_autorizados")
     rows = cur.fetchall()
@@ -277,7 +287,7 @@ async def responder_busqueda(update: Update, termino: str):
         etiqueta = f"{nombre} — {carnet or 'sin carnet'} ({estado})"
         filas.append([InlineKeyboardButton(etiqueta, callback_data=f"ver_exp:{expediente_id}")])
     await update.message.reply_text(
-        f"Encontré {len(resultados)} expedientes que coinciden con '{termino}'. ¿Cuál quieres ver?",
+        f"Encontré {len(resultados)} expedientes que coinciden con '{termino}'. ¿Cuál quieres ver%s",
         reply_markup=InlineKeyboardMarkup(filas),
     )
 
@@ -295,14 +305,14 @@ async def manejar_ver_expediente(update: Update, context: ContextTypes.DEFAULT_T
 
 
 def buscar_expediente_con_id(termino):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     like = f"%{termino}%"
     cur.execute(
         """
         SELECT id, nombre, carnet, estado, departamento, ubicacion
         FROM expedientes
-        WHERE nombre LIKE ? OR carnet LIKE ?
+        WHERE nombre LIKE %s OR carnet LIKE %s
         """,
         (like, like),
     )
@@ -315,10 +325,10 @@ def buscar_por_carnet_exacto(carnet):
     """Busca un expediente cuyo carnet coincida EXACTAMENTE (ignora '-' o vacío)."""
     if not carnet or carnet.strip() in ("-", ""):
         return None
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, nombre, carnet, estado, departamento, ubicacion FROM expedientes WHERE carnet = ?",
+        "SELECT id, nombre, carnet, estado, departamento, ubicacion FROM expedientes WHERE carnet = %s",
         (carnet.strip(),),
     )
     row = cur.fetchone()
@@ -327,10 +337,10 @@ def buscar_por_carnet_exacto(carnet):
 
 
 def obtener_expediente_por_id(expediente_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, nombre, carnet, estado, departamento, ubicacion FROM expedientes WHERE id = ?",
+        "SELECT id, nombre, carnet, estado, departamento, ubicacion FROM expedientes WHERE id = %s",
         (expediente_id,),
     )
     row = cur.fetchone()
@@ -342,18 +352,18 @@ def actualizar_campo_expediente(expediente_id, campo, valor):
     columnas_validas = {"nombre", "carnet", "estado", "departamento", "ubicacion"}
     if campo not in columnas_validas:
         raise ValueError("Campo no válido")
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute(f"UPDATE expedientes SET {campo} = ? WHERE id = ?", (valor, expediente_id))
+    cur.execute(f"UPDATE expedientes SET {campo} = %s WHERE id = %s", (valor, expediente_id))
     conn.commit()
     conn.close()
 
 
 def actualizar_expediente(expediente_id, estado, departamento, ubicacion):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE expedientes SET estado = ?, departamento = ?, ubicacion = ? WHERE id = ?",
+        "UPDATE expedientes SET estado = %s, departamento = %s, ubicacion = %s WHERE id = %s",
         (estado, departamento, ubicacion, expediente_id),
     )
     conn.commit()
@@ -361,12 +371,12 @@ def actualizar_expediente(expediente_id, estado, departamento, ubicacion):
 
 
 def agregar_expediente(nombre, carnet, estado, departamento, ubicacion):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO expedientes (nombre, carnet, estado, departamento, ubicacion)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
         """,
         (nombre, carnet, estado, departamento, ubicacion),
     )
@@ -375,11 +385,11 @@ def agregar_expediente(nombre, carnet, estado, departamento, ubicacion):
 
 
 def marcar_baja(termino):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     like = f"%{termino}%"
     cur.execute(
-        "UPDATE expedientes SET estado = 'Baja' WHERE nombre LIKE ? OR carnet LIKE ?",
+        "UPDATE expedientes SET estado = 'Baja' WHERE nombre LIKE %s OR carnet LIKE %s",
         (like, like),
     )
     affected = cur.rowcount
@@ -389,11 +399,11 @@ def marcar_baja(termino):
 
 
 def marcar_retirado(termino):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     like = f"%{termino}%"
     cur.execute(
-        "UPDATE expedientes SET estado = 'Retirado' WHERE nombre LIKE ? OR carnet LIKE ?",
+        "UPDATE expedientes SET estado = 'Retirado' WHERE nombre LIKE %s OR carnet LIKE %s",
         (like, like),
     )
     affected = cur.rowcount
@@ -403,9 +413,9 @@ def marcar_retirado(termino):
 
 
 def eliminar_expediente_por_id(expediente_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM expedientes WHERE id = ?", (expediente_id,))
+    cur.execute("DELETE FROM expedientes WHERE id = %s", (expediente_id,))
     affected = cur.rowcount
     conn.commit()
     conn.close()
@@ -413,7 +423,7 @@ def eliminar_expediente_por_id(expediente_id):
 
 
 def contar_expedientes():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT estado, COUNT(*) FROM expedientes GROUP BY estado")
     rows = cur.fetchall()
@@ -422,7 +432,7 @@ def contar_expedientes():
 
 
 def obtener_todos_expedientes():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         "SELECT nombre, carnet, estado, departamento, ubicacion FROM expedientes ORDER BY nombre"
@@ -513,9 +523,9 @@ async def manejar_aprobacion(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = int(user_id_str)
 
     if accion == "aprobar":
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT nombre, username FROM solicitudes_pendientes WHERE user_id = ?", (user_id,))
+        cur.execute("SELECT nombre, username FROM solicitudes_pendientes WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
         conn.close()
         nombre, username = row if row else ("", "")
@@ -545,7 +555,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Hola, soy {NOMBRE_BOT} 🤖, tu asistente de expedientes laborales.\n\n"
         "Puedes tocar una opción del menú de abajo, o simplemente escribirme algo como:\n"
-        f"\"{NOMBRE_BOT}, ¿dónde está el expediente de Ali?\"",
+        f"\"{NOMBRE_BOT}, ¿dónde está el expediente de Ali%s\"",
         reply_markup=construir_menu(update.effective_user.id),
     )
 
@@ -555,7 +565,7 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     texto = (
         f"Soy {NOMBRE_BOT}. Puedes usar los botones del menú, o escribirme directamente, por ejemplo:\n"
-        f"\"{NOMBRE_BOT}, ¿dónde está el expediente de Ali?\"\n\n"
+        f"\"{NOMBRE_BOT}, ¿dónde está el expediente de Ali%s\"\n\n"
         f"{BTN_BUSCAR} - busca un expediente por nombre o carnet\n"
         f"{BTN_LISTA} - resumen de cuántos expedientes hay\n"
         f"{BTN_EXPORTAR} - descarga el listado completo en Excel\n"
@@ -623,9 +633,9 @@ async def cambiar_rol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not esta_autorizado(user_id) or es_admin(user_id):
         await update.message.reply_text("Ese ID no está en la lista de usuarios autorizados.")
         return
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("UPDATE usuarios_autorizados SET rol = ? WHERE user_id = ?", (nuevo_rol, user_id))
+    cur.execute("UPDATE usuarios_autorizados SET rol = %s WHERE user_id = %s", (nuevo_rol, user_id))
     conn.commit()
     conn.close()
     await update.message.reply_text(f"Rol actualizado para el ID {user_id}: {nuevo_rol}")
@@ -744,7 +754,7 @@ async def agregar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No tienes permiso para agregar expedientes (solo puedes buscar).")
         return ConversationHandler.END
     await update.message.reply_text(
-        "Vamos a agregar un expediente nuevo.\n\n¿Cuál es el nombre completo?",
+        "Vamos a agregar un expediente nuevo.\n\n¿Cuál es el nombre completo%s",
         reply_markup=ReplyKeyboardMarkup([[BTN_CANCELAR]], resize_keyboard=True),
     )
     return NOMBRE
@@ -752,7 +762,7 @@ async def agregar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def agregar_nombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["nombre"] = update.message.text
-    await update.message.reply_text("¿Cuál es el carnet de identidad? (o escribe - si no aplica)")
+    await update.message.reply_text("¿Cuál es el carnet de identidad%s (o escribe - si no aplica)")
     return CARNET
 
 
@@ -773,7 +783,7 @@ async def agregar_carnet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Ya existe un expediente con ese carnet de identidad:\n\n"
             f"{formatear_expediente(nombre, carnet_existente, estado, departamento, ubicacion)}\n\n"
-            "¿Qué quieres hacer? (por ejemplo, si esta persona se está recontratando, "
+            "¿Qué quieres hacer%s (por ejemplo, si esta persona se está recontratando, "
             "lo más práctico es actualizar el expediente existente con el estado y ubicación nuevos)",
             reply_markup=teclado,
         )
@@ -820,7 +830,7 @@ async def agregar_departamento_boton(update: Update, context: ContextTypes.DEFAU
     departamento = DEPARTAMENTOS[indice]
     context.user_data["departamento"] = departamento
     await query.edit_message_text(f"Departamento seleccionado: {departamento}")
-    await query.message.reply_text("¿Cuál es la ubicación física del expediente? (ej. ABT-12, Estante 3)")
+    await query.message.reply_text("¿Cuál es la ubicación física del expediente%s (ej. ABT-12, Estante 3)")
     return UBICACION
 
 
@@ -950,7 +960,7 @@ async def eliminar_recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
     await update.message.reply_text(
-        f"⚠️ ¿Seguro que quieres ELIMINAR PERMANENTEMENTE este expediente?\n\n"
+        f"⚠️ ¿Seguro que quieres ELIMINAR PERMANENTEMENTE este expediente%s\n\n"
         f"👤 {nombre}\n🪪 Carnet: {carnet or '—'}\n📍 Ubicación: {ubicacion}\n\n"
         "Esta acción no se puede deshacer.",
         reply_markup=teclado,
@@ -1023,7 +1033,7 @@ async def editar_buscar_recibir(update: Update, context: ContextTypes.DEFAULT_TY
         ]
         context.user_data["candidatos_editar"] = resultados
         await update.message.reply_text(
-            "Encontré varios expedientes. ¿Cuál quieres editar?",
+            "Encontré varios expedientes. ¿Cuál quieres editar%s",
             reply_markup=InlineKeyboardMarkup(filas),
         )
         return ESPERANDO_BUSQUEDA_EDITAR
@@ -1056,7 +1066,7 @@ async def iniciar_edicion_campo(update, context, expediente_row, es_callback=Fal
     ]
     texto = (
         f"Expediente actual:\n\n{formatear_expediente(nombre, carnet, estado, departamento, ubicacion)}\n\n"
-        "¿Qué campo quieres modificar?"
+        "¿Qué campo quieres modificar%s"
     )
     if es_callback:
         await update.callback_query.message.reply_text(texto, reply_markup=InlineKeyboardMarkup(filas))
@@ -1148,7 +1158,7 @@ async def manejar_texto_libre(update: Update, context: ContextTypes.DEFAULT_TYPE
     termino = detectar_busqueda_natural(update.message.text)
     if not termino:
         await update.message.reply_text(
-            f"No te entendí. Puedes escribirme algo como \"{NOMBRE_BOT}, ¿dónde está el expediente de Ali?\", "
+            f"No te entendí. Puedes escribirme algo como \"{NOMBRE_BOT}, ¿dónde está el expediente de Ali%s\", "
             "o usar el menú de abajo.",
             reply_markup=construir_menu(update.effective_user.id),
         )
@@ -1272,7 +1282,7 @@ def main():
 
     # Este handler va al final: solo captura texto que no fue un botón
     # ni parte de una conversación activa, e intenta interpretarlo como
-    # una búsqueda en lenguaje natural (ej. "Lucas, ¿dónde está Ali?").
+    # una búsqueda en lenguaje natural (ej. "Lucas, ¿dónde está Ali%s").
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_texto_libre))
 
     logger.info("Bot iniciado. Esperando mensajes...")
