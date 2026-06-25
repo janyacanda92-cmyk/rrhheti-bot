@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "expedientes.db")
+DB_PATH = os.path.join(os.environ.get("DB_DIR", os.path.dirname(__file__)), "expedientes.db")
 
 # ID de Telegram del administrador (tu cuenta). Siempre tiene acceso total.
 ADMIN_USER_ID = 1186207945
