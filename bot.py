@@ -17,8 +17,8 @@ Autor: generado con Claude
 import logging
 import os
 import re
-import psycopg2
-import psycopg2.extras
+import pg8000.dbapi
+from urllib.parse import urlparse, unquote
 from io import BytesIO
 
 from openpyxl import Workbook
@@ -57,7 +57,14 @@ def get_conn():
             "Falta la variable de entorno DATABASE_URL. "
             "Asegúrate de haber agregado una base de datos PostgreSQL en Railway."
         )
-    return psycopg2.connect(DATABASE_URL)
+    parsed = urlparse(DATABASE_URL)
+    return pg8000.dbapi.connect(
+        host=parsed.hostname,
+        port=parsed.port or 5432,
+        database=parsed.path.lstrip("/"),
+        user=unquote(parsed.username) if parsed.username else None,
+        password=unquote(parsed.password) if parsed.password else None,
+    )
 
 # ID de Telegram del administrador (tu cuenta). Siempre tiene acceso total.
 ADMIN_USER_ID = 1186207945
